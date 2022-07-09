@@ -20,16 +20,22 @@ impl<T> Mutex<T> {
     } 
 
     pub fn with_lock<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        while self.locked.load(Ordering::Relaxed) != UNLOCKED {}
+        // x86: CAS
+        // ARM: LDREX STREX
+        //      - compare_exchange: impl using a loop of LDREX and STREx
+        //      - compare_exchange_weak: LDREX STREX
+        while self.locked.compare_exchange_weak(
+          UNLOCKED, 
+          LOCKED, 
+          Ordering::Acquire, 
+          Ordering::Relaxed).is_err() 
+        {
+            // Mesi protocol: stay in S when locked
+            while self.locked.load(Ordering::Relaxed) == LOCKED {}
+        }
 
-        /**
-         * /\ LOAD
-         * .. threads can data race in between
-         * \/ STORE
-         */
-        self.locked.store(LOCKED, Ordering::Relaxed);
         let res = f(unsafe { &mut *self.v.get() });
-        self.locked.store(UNLOCKED, Ordering::Relaxed);
+        self.locked.store(UNLOCKED, Ordering::Release);
 
         res
     }
@@ -53,4 +59,27 @@ fn main() {
     }
 
     assert_eq!(l.with_lock(|v| *v), 10 * 100);
+}
+
+#[test]
+fn too_relaxed() {
+    use std::sync::atomic::{ AtomicUsize };
+
+    let x: &'static _ = Box::leak(Box::new(AtomicUsize::new(0)));
+    let y: &'static _ = Box::leak(Box::new(AtomicUsize::new(0)));
+
+    let t1 = std::thread::spawn(move || {
+        let r1 = y.load(Ordering::Relaxed);
+        x.store(r1, Ordering::Relaxed);
+        r1
+    });
+
+    let t2 = std::thread::spawn(move || {
+        let r2 = x.load(Ordering::Relaxed);
+        y.store(42, Ordering::Relaxed);
+        r2
+    });
+
+    let r1 = t1.join().unwrap();
+    let r2 = t2.join().unwrap();
 }
